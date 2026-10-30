@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Secure Chat</title>
+<style>
+:root{--bg:#eef1f6;--panel:#fff;--ink:#14213d;--mute:#6b7690;--line:#dde3ee;--accent:#2b59c3;--mine:#dce6fb;--theirs:#fff}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1424;--panel:#161d33;--ink:#e8ecf6;--mute:#8d98b4;--line:#27304a;--accent:#7ea2f5;--mine:#243a73;--theirs:#1d2640}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font:16px/1.45 "Noto Sans","PingFang SC","Microsoft YaHei","Noto Sans Devanagari",system-ui,sans-serif;background:var(--bg);color:var(--ink)}
+button,input{font:inherit;color:inherit}
+input{width:100%;padding:.7rem .8rem;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
+button{padding:.7rem 1rem;border:0;border-radius:10px;background:var(--accent);color:#fff;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.hidden{display:none!important}
+#login{max-width:380px;margin:12vh auto;padding:1.5rem}
+#login h1{font-size:1.6rem;margin:0 0 .3rem}
+#login p{color:var(--mute);margin:.2rem 0 1rem}
+#login .row{display:flex;flex-direction:column;gap:.7rem}
+#err{color:#c0392b;min-height:1.4em;margin-top:.6rem}
+#app{display:grid;grid-template-columns:300px 1fr;height:100%}
+#side{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+#side header{padding:1rem;border-bottom:1px solid var(--line)}
+#me{font-weight:600;word-break:break-all}
+#add{display:flex;gap:.5rem;margin-top:.7rem}
+#peers{overflow:auto;flex:1}
+.peer{display:block;width:100%;text-align:left;background:none;color:var(--ink);border-radius:0;padding:.85rem 1rem;border-bottom:1px solid var(--line);font-weight:500}
+.peer.on{background:var(--mine)}
+#main{display:flex;flex-direction:column;min-height:0;min-width:0}
+#head{padding:.9rem 1rem;background:var(--panel);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:.6rem}
+#back{display:none}
+#log{flex:1;overflow:auto;padding:1rem;display:flex;flex-direction:column;gap:.45rem}
+.b{max-width:min(75%,34rem);padding:.5rem .75rem;border-radius:14px;background:var(--theirs);border:1px solid var(--line);overflow-wrap:anywhere;white-space:pre-wrap}
+.b.me{align-self:flex-end;background:var(--mine);border-color:transparent}
+.b time{display:block;font-size:.72rem;color:var(--mute);margin-top:.15rem}
+.empty{margin:auto;color:var(--mute);text-align:center;max-width:22rem}
+#form{display:flex;gap:.5rem;padding:.7rem;padding-bottom:calc(.7rem + env(safe-area-inset-bottom,0px));background:var(--panel);border-top:1px solid var(--line)}
+@media (max-width:700px){
+ #app{grid-template-columns:1fr}
+ #app.chat #side{display:none}
+ #app:not(.chat) #main{display:none}
+ #back{display:inline-block}
+}
+</style>
+</head>
+<body>
+<section id="login">
+  <h1>Secure Chat</h1>
+  <p>Messages are encrypted on your device. Only you and the person you write to can read them.</p>
+  <div class="row" id="s1">
+    <input id="phone" type="tel" inputmode="tel" placeholder="+91 98765 43210 or +86 138 0013 8000" autocomplete="tel">
+    <button id="getCode">Send code</button>
+  </div>
+  <div class="row hidden" id="s2">
+    <input id="code" inputmode="numeric" maxlength="6" placeholder="6-digit code" autocomplete="one-time-code">
+    <button id="verify">Sign in</button>
+    <button class="ghost" id="change">Use a different number</button>
+  </div>
+  <div id="err" role="alert"></div>
+</section>
+
+<div id="app" class="hidden">
+  <aside id="side">
+    <header>
+      <div id="me"></div>
+      <div id="add"><input id="newPeer" type="tel" placeholder="Number to chat with"><button id="open">Chat</button></div>
+      <div id="err2" style="color:#c0392b;font-size:.85rem;margin-top:.4rem" role="alert"></div>
+    </header>
+    <div id="peers"></div>
+  </aside>
+  <main id="main">
+    <div id="head"><button class="ghost" id="back" aria-label="Back to chats">Back</button><strong id="title">Select a chat</strong></div>
+    <div id="log"><div class="empty">Enter a phone number on the left to start an encrypted chat. The other person must have signed in once.</div></div>
+    <form id="form" class="hidden"><input id="text" placeholder="Write a message" autocomplete="off"><button>Send</button></form>
+  </main>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder(), dec = new TextDecoder();
+const b64 = buf => { let s = ''; new Uint8Array(buf).forEach(c => s += String.fromCharCode(c)); return btoa(s); };
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const ECDH = { name: 'ECDH', namedCurve: 'P-256' };
+
+// Keys live in IndexedDB as non-extractable CryptoKeys: the private key never leaves this browser.
+const idb = () => new Promise((ok, no) => { const r = indexedDB.open('securechat', 1); r.onupgradeneeded = () => r.result.createObjectStore('k'); r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error); });
+const kv = async (mode, key, val) => { const d = await idb(); return new Promise((ok, no) => { const st = d.transaction('k', mode === 'get' ? 'readonly' : 'readwrite').objectStore('k'); const q = mode === 'get' ? st.get(key) : st.put(val, key); q.onsuccess = () => ok(q.result); q.onerror = () => no(q.error); }); };
+
+let auth = JSON.parse(localStorage.getItem('auth') || 'null');
+let kp, ws, current = null, peers = JSON.parse(localStorage.getItem('peers') || '[]');
+const aes = {};
+
+const api = async (path, opts = {}) => {
+  const r = await fetch(path, { ...opts, headers: { 'Content-Type': 'application/json', ...(auth ? { Authorization: 'Bearer ' + auth.token } : {}) }, body: opts.body && JSON.stringify(opts.body) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { if (r.status === 401 && auth) logout(); throw new Error(j.error || 'Request failed'); }
+  return j;
+};
+const normalize = s => '+' + String(s).replace(/[^\d]/g, '');
+const logout = () => { localStorage.removeItem('auth'); location.reload(); };
+
+// ---- Login ----
+let phone;
+$('getCode').onclick = async () => {
+  $('err').textContent = '';
+  phone = normalize($('phone').value);
+  try {
+    const r = await api('/api/otp', { method: 'POST', body: { phone } });
+    $('s1').classList.add('hidden'); $('s2').classList.remove('hidden');
+    if (r.devCode) $('code').value = r.devCode; // dev mode only
+  } catch (e) { $('err').textContent = e.message; }
+};
+$('change').onclick = () => { $('s2').classList.add('hidden'); $('s1').classList.remove('hidden'); };
+$('verify').onclick = async () => {
+  $('err').textContent = '';
+  try {
+    kp = await kv('get', 'kp:' + phone);
+    if (!kp) { kp = await crypto.subtle.generateKey(ECDH, false, ['deriveKey']); await kv('put', 'kp:' + phone, kp); }
+    const publicKey = await crypto.subtle.exportKey('jwk', kp.publicKey);
+    const r = await api('/api/verify', { method: 'POST', body: { phone, code: $('code').value.trim(), publicKey } });
+    auth = { phone, token: r.token }; localStorage.setItem('auth', JSON.stringify(auth));
+    start();
+  } catch (e) { $('err').textContent = e.message; }
+};
+
+// ---- Encryption ----
+async function keyFor(peer) {
+  if (aes[peer]) return aes[peer];
+  const u = await api('/api/user/' + encodeURIComponent(peer));
+  const pub = await crypto.subtle.importKey('jwk', u.publicKey, ECDH, false, []);
+  return aes[peer] = await crypto.subtle.deriveKey({ name: 'ECDH', public: pub }, kp.privateKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function decrypt(m) {
+  try {
+    const peer = m.from === auth.phone ? m.to : m.from;
+    return dec.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(m.iv) }, await keyFor(peer), unb64(m.ct)));
+  } catch { return '[Cannot decrypt: keys changed or message is from another device]'; }
+}
+
+// ---- UI ----
+async function start() {
+  kp = kp || await kv('get', 'kp:' + auth.phone);
+  if (!kp) return logout(); // keys missing on this browser: sign in again
+  $('login').classList.add('hidden'); $('app').classList.remove('hidden');
+  $('me').textContent = auth.phone;
+  renderPeers(); connect();
+}
+function renderPeers() {
+  $('peers').replaceChildren(...peers.map(p => { const b = document.createElement('button'); b.className = 'peer' + (p === current ? ' on' : ''); b.textContent = p; b.onclick = () => openChat(p); return b; }));
+}
+$('open').onclick = async () => {
+  $('err2').textContent = '';
+  const p = normalize($('newPeer').value);
+  try { await api('/api/user/' + encodeURIComponent(p)); } catch (e) { return $('err2').textContent = e.message; }
+  if (!peers.includes(p)) { peers.unshift(p); localStorage.setItem('peers', JSON.stringify(peers)); }
+  $('newPeer').value = ''; openChat(p);
+};
+async function openChat(p) {
+  current = p; renderPeers();
+  $('title').textContent = p; $('form').classList.remove('hidden'); $('app').classList.add('chat');
+  $('log').replaceChildren();
+  for (const m of await api('/api/messages?peer=' + encodeURIComponent(p))) await show(m);
+  $('text').focus();
+}
+$('back').onclick = () => $('app').classList.remove('chat');
+async function show(m) {
+  const d = document.createElement('div'); d.className = 'b' + (m.from === auth.phone ? ' me' : '');
+  d.textContent = await decrypt(m);
+  const t = document.createElement('time'); t.textContent = new Date(m.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  d.append(t); $('log').append(d); $('log').scrollTop = 1e9;
+}
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws?token=' + encodeURIComponent(auth.token));
+  ws.onmessage = async e => {
+    const { type, msg } = JSON.parse(e.data); if (type !== 'msg') return;
+    const peer = msg.from === auth.phone ? msg.to : msg.from;
+    if (!peers.includes(peer)) { peers.unshift(peer); localStorage.setItem('peers', JSON.stringify(peers)); renderPeers(); }
+    if (peer === current) show(msg);
+  };
+  ws.onclose = e => { if (e.code !== 4001) setTimeout(connect, 2000); else logout(); };
+}
+$('form').onsubmit = async e => {
+  e.preventDefault();
+  const text = $('text').value.trim(); if (!text || !current || ws.readyState !== 1) return;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await keyFor(current), enc.encode(text));
+  ws.send(JSON.stringify({ type: 'send', to: current, iv: b64(iv), ct: b64(ct) }));
+  $('text').value = '';
+};
+
+if (auth) start();
+</script>
+</body>
+</html>
